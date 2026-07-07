@@ -2,22 +2,25 @@
 lol_elo.py  --  Season-by-season Elo for League of Legends esports, in one file.
 
 WHAT IT DOES
-  * Downloads real historical match data (Oracle's Elixir, 2014 -> now).
-  * Runs a two-tier Elo: team ratings reset each season, region ratings carry
-    over, and a region's rating only moves when its teams play internationally.
-  * Prints final standings and writes CSVs (+ a chart if matplotlib is around).
+  * Loads real historical match data (Oracle's Elixir, 2014 -> now), auto-
+    downloading when possible, and rates TIER-1 LEAGUES ONLY (with year windows
+    so e.g. LJL/VCS/PCS stop counting once they became tier-2 under the LCP).
+  * Rates SERIES, not individual games: a Bo5 is one update, and the score
+    matters -- a 3-0 sweep swings ratings more than a 3-2 (margin weighting).
+  * Two-tier Elo: team ratings reset each season, region ratings carry over,
+    and region ratings only move at international events. International K is
+    staged: each event has its own weight, knockout series weigh extra, and
+    regions with little international history get a provisional K boost so
+    they converge to their true level quickly instead of hugging 1500.
+  * New regions born from mergers (LCP 2025) inherit the average Elo of their
+    actual incoming teams. Defunct teams are dropped; new teams enter at the
+    bottom-quartile seed of their league.
+  * Reports region strength and top 20 teams for EVERY year, writes CSVs, and
+    draws two charts.
 
 HOW TO RUN
-  1. pip install pandas          (matplotlib is optional, for the chart)
+  1. pip install pandas matplotlib
   2. python lol_elo.py
-  The first run downloads the data into a local `data/` folder (a few minutes,
-  once). Later runs reuse it. Works locally, in a GitHub Codespace, or pasted
-  into a Google Colab cell.
-
-EDITING
-  Everything you'd want to change is in the CONFIG block right below. Change a
-  number, save, re-run. You rarely need to touch anything under the "MACHINERY"
-  divider further down.
 
 DATA CREDIT
   Match data aggregated and freely provided by Tim "Magic" Sevenhuysen of
@@ -37,35 +40,71 @@ import pandas as pd
 #  CONFIG  --  edit these, then re-run.
 # ============================================================================
 
-FIRST_YEAR = 2014          # earliest year of data to include (2014 = earliest available)
-LAST_YEAR = 2026           # latest year; the current year's file updates daily
-DATA_DIR = "data"          # where downloaded CSVs are cached
+FIRST_YEAR = 2014
+LAST_YEAR = 2026
+DATA_DIR = "data"
 
-# Which domestic leagues to include. None = every league found in the files.
-# For a clean run focused on the big regions, uncomment the set below and make
-# the codes match what gets printed under "Leagues found in the data:" -- Oracle's
-# Elixir's exact spellings can differ (e.g. "LTA N" vs "LTA North"), so copy them
-# from that printout rather than trusting these guesses.
-LEAGUES = None
-# LEAGUES = {"LCK", "LPL", "LEC", "LCS", "CBLOL", "LCP", "PCS", "LMS", "LTA N", "LTA S"}
+# --- WHICH LEAGUES COUNT ----------------------------------------------------
+# league code -> (region it counts toward, first tier-1 year, last tier-1 year)
+# None = open bound. Games outside the window are ignored; leagues not listed
+# at all (tier-2, academy, college, cups) are ignored completely.
+LEAGUE_TO_REGION = {
+    "LCK":    ("LCK",   None, None),
+    "OGN":    ("LCK",   None, None),    # pre-2015 name of the LCK
+    "LPL":    ("LPL",   None, None),
+    "LEC":    ("LEC",   None, None),
+    "EU LCS": ("LEC",   None, None),
+    "LCS":    ("LCS",   None, None),
+    "NA LCS": ("LCS",   None, None),
+    "LTA N":  ("LCS",   2025, 2025),    # 2025 conference continuing the LCS line
+    "CBLOL":  ("CBLOL", None, None),
+    "LTA S":  ("CBLOL", 2025, 2025),
+    "LCP":    ("LCP",   2025, None),    # merged APAC league
+    "PCS":    ("PCS",   2020, 2024),    # tier-2 feeder after 2024
+    "LMS":    ("LMS",   None, 2019),
+    "VCS":    ("VCS",   None, 2024),    # tier-2 feeder after 2024
+    "LJL":    ("LJL",   None, 2024),    # tier-2 feeder after 2024
+}
 
-# League codes that are INTERNATIONAL (cross-region) events. These are the only
-# games that move a region's rating. Add any the printout shows you're missing.
-INTERNATIONAL = {"WLDs", "Worlds", "MSI", "First Stand", "FST", "IEM", "WCS", "Rift Rivals"}
+# --- INTERNATIONAL EVENTS & STAGE WEIGHTS ------------------------------------
+# Each international event gets its OWN base K -- Worlds moves ratings the
+# most, minor events the least. Only games where both teams belong to a mapped
+# tier-1 region are rated. Remove an event to stop counting it entirely.
+INTERNATIONAL_K = {
+    "WLDs": 44.0,   # World Championship
+    "MSI":  36.0,   # Mid-Season Invitational
+    "FST":  28.0,   # First Stand (2025-)
+    "MSC":  28.0,   # Mid-Season Cup (2020)
+    "EWC":  24.0,   # Esports World Cup (2024-)
+    "IEM":  20.0,   # IEM Katowice era events
+}
+PLAYOFF_MULT = 1.25   # knockout/bracket series at internationals weigh this much
+                      # extra (uses the data's `playoffs` flag)
 
-# Stitch renamed / merged leagues together so a region's history stays continuous.
-# (In 2025 the Americas ran as "LTA North/South", continuing the LCS/CBLOL lines.)
-# Left side = code in the data, right side = the region name you want it counted as.
-REGION_ALIASES = {"LTA N": "LCS", "LTA S": "CBLOL"}
+# Provisional boost: while a REGION has played few career international
+# series, its cross-region K is multiplied by up to PROVISIONAL_BOOST,
+# decaying linearly to 1.0 by PROVISIONAL_SERIES. This is what lets a region
+# with only a couple of international series per year (hi, CBLOL) fall/rise
+# to its true level quickly instead of hovering near its 1500 starting point.
+PROVISIONAL_SERIES = 40
+PROVISIONAL_BOOST = 2.0
 
-# --- Elo knobs -------------------------------------------------------------
-INITIAL_RATING = 1500.0        # every region starts here in the first year
-K_REGIONAL = 24.0              # how much a domestic game moves ratings
-K_INTERNATIONAL = 40.0        # international games weigh more (only cross-region signal)
-SEED_SPACING = 25.0           # rating gap between adjacent seeds at season start
-PRESERVE_REGION_MEAN = True   # True: region strength carries over exactly (recommended)
-                              # False: fan seeds upward from the region rating (inflates
-                              #        every region a little each season -- your first sketch)
+# --- SERIES & MARGIN ----------------------------------------------------------
+# Games between the same two teams in the same league on the same day are one
+# series, rated once. The margin multiplier scales the update by how lopsided
+# the series was:  mult = MARGIN_MIN + (1 - MARGIN_MIN) * (W - L) / W
+#   3-0 -> 1.00      3-1 -> 0.80      3-2 -> 0.60      (with MARGIN_MIN = 0.4)
+#   2-0 -> 1.00      2-1 -> 0.70      1-0 -> 1.00 (a Bo1 is all the info we get)
+MARGIN_MIN = 0.4
+
+# --- Elo knobs ------------------------------------------------------------------
+INITIAL_RATING = 1500.0
+K_REGIONAL = 28.0            # per domestic SERIES (series are rarer than games,
+                             # so this sits a bit above the old per-game 24)
+SEED_SPACING = 25.0
+PRESERVE_REGION_MEAN = True
+NEW_TEAM_QUANTILE = 0.25
+TOP_N = 20
 
 # ============================================================================
 #  MACHINERY  --  you usually don't need to edit below here.
@@ -73,16 +112,25 @@ PRESERVE_REGION_MEAN = True   # True: region strength carries over exactly (reco
 
 OE_BUCKET = "https://oracleselixir-downloadable-match-data.s3-us-west-2.amazonaws.com"
 _UA = {"User-Agent": "Mozilla/5.0 (lol-elo)"}
-NEEDED_COLS = ["gameid", "league", "year", "date", "side", "position", "teamname", "result"]
+NEEDED_COLS = ["gameid", "league", "year", "date", "side", "position",
+               "teamname", "result", "playoffs"]
 
 
-# ---- data download --------------------------------------------------------
+def region_for(league, year):
+    if league not in LEAGUE_TO_REGION:
+        return None
+    region, first, last = LEAGUE_TO_REGION[league]
+    if first is not None and year < first:
+        return None
+    if last is not None and year > last:
+        return None
+    return region
+
+
+# ---- data download -----------------------------------------------------------
 
 def _candidate_urls(year):
-    """URLs to try for a given year, best guess first."""
-    # Undated canonical form (works for many years).
     yield f"{OE_BUCKET}/{year}_LoL_esports_match_data_from_OraclesElixir.csv"
-    # Dated form, walking back from today -- catches the daily-updated current year.
     today = datetime.date.today()
     for d in range(0, 14):
         stamp = (today - datetime.timedelta(days=d)).strftime("%Y%m%d")
@@ -90,7 +138,6 @@ def _candidate_urls(year):
 
 
 def download_year(year):
-    """Fetch one year's CSV into DATA_DIR, or explain how to grab it by hand."""
     os.makedirs(DATA_DIR, exist_ok=True)
     dest = os.path.join(DATA_DIR, f"{year}.csv")
     if os.path.exists(dest) and os.path.getsize(dest) > 1000:
@@ -112,54 +159,71 @@ def download_year(year):
 
 
 def load_year(year):
-    """Return this year's team-summary rows (2 per game) as a slim DataFrame."""
     path = os.path.join(DATA_DIR, f"{year}.csv")
     if not (os.path.exists(path) and os.path.getsize(path) > 1000):
         path = download_year(year)
     if not path:
         return None
     df = pd.read_csv(path, low_memory=False)
-    keep = [c for c in NEEDED_COLS if c in df.columns]
-    df = df[keep]
-    df = df[df["position"] == "team"]                       # 2 team rows per game
+    df = df[[c for c in NEEDED_COLS if c in df.columns]]
+    df = df[df["position"] == "team"]
     df = df.dropna(subset=["teamname", "result", "gameid"])
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "playoffs" not in df.columns:
+        df["playoffs"] = 0
     return df
 
 
-# ---- Elo math -------------------------------------------------------------
+# ---- Elo math -------------------------------------------------------------------
 
 def expected(a, b):
     return 1.0 / (1.0 + 10.0 ** ((b - a) / 400.0))
 
 
-def update(a, b, score_a, k):
-    """New (a, b) after a result. Zero-sum: a's gain is exactly b's loss."""
-    delta = k * (score_a - expected(a, b))
-    return a + delta, b - delta
+def margin_mult(w, l):
+    """Update multiplier from series score: sweeps full weight, close ones less."""
+    if w <= 0:
+        return MARGIN_MIN
+    return MARGIN_MIN + (1.0 - MARGIN_MIN) * (w - l) / w
 
 
-def seed_ratings(region_rating, ranked_teams):
-    """Fan a region's teams around its carried rating, best seed first."""
-    n = len(ranked_teams)
+def seed_fan(n, center):
     if PRESERVE_REGION_MEAN:
         mid = (n - 1) / 2.0
-        offsets = [(mid - i) * SEED_SPACING for i in range(n)]   # symmetric, sums to 0
-    else:
-        offsets = [(n - 1 - i) * SEED_SPACING for i in range(n)]  # fan upward from floor
-    return {t: region_rating + off for t, off in zip(ranked_teams, offsets)}
+        return [center + (mid - i) * SEED_SPACING for i in range(n)]
+    return [center + (n - 1 - i) * SEED_SPACING for i in range(n)]
 
 
-def region_of(league):
-    """Map a raw league code to the region name we count it under."""
-    return REGION_ALIASES.get(league, league)
+def build_series(df):
+    """Fold this year's games into series: same league + same day + same two
+    teams = one series. Returns rows sorted by date. (Rare quirk: a same-day
+    tiebreaker vs the same opponent merges into that day's series.)"""
+    agg = {}
+    for gid, rows in df.groupby("gameid"):
+        if len(rows) != 2:
+            continue
+        rows = rows.sort_values("side")
+        a, b = rows.iloc[0], rows.iloc[1]
+        day = a["date"].date() if not pd.isna(a["date"]) else None
+        t1, t2 = sorted([a["teamname"], b["teamname"]])
+        key = (a["league"], day, t1, t2)
+        s = agg.setdefault(key, {"league": a["league"], "date": a["date"],
+                                 "team_a": t1, "team_b": t2,
+                                 "wins_a": 0, "wins_b": 0, "playoffs": False})
+        winner = a["teamname"] if a["result"] == 1 else b["teamname"]
+        s["wins_a" if winner == t1 else "wins_b"] += 1
+        try:
+            s["playoffs"] = s["playoffs"] or int(a.get("playoffs", 0) or 0) == 1
+        except (TypeError, ValueError):
+            pass
+        if not pd.isna(a["date"]) and (pd.isna(s["date"]) or a["date"] < s["date"]):
+            s["date"] = a["date"]
+    out = list(agg.values())
+    out.sort(key=lambda s: (pd.isna(s["date"]), s["date"]))
+    return out
 
 
-def in_scope(region):
-    return LEAGUES is None or region in {region_of(x) for x in LEAGUES}
-
-
-# ---- the season-by-season run --------------------------------------------
+# ---- the season-by-season run ------------------------------------------------------
 
 def run():
     years = list(range(FIRST_YEAR, LAST_YEAR + 1))
@@ -177,124 +241,166 @@ def run():
     print("\nLeagues found in the data:")
     print("  " + ", ".join(all_leagues))
 
-    team_rating = {}                     # team -> current Elo (persists across years)
-    carried_region = {}                  # region -> rating carried into next season
-    prev_end = {}                        # team -> rating at end of previous year (for seeding)
-    region_history = []                  # (year, region, rating) rows for output
-    match_history = []                   # per-match change log for output
+    team_rating = {}
+    carried_region = {}
+    prev_end = {}
+    intl_series_count = defaultdict(int)   # region -> career rated intl series
+    region_history = []
+    series_history = []
+    yearly_top = {}
 
-    def rating_of(team):
-        return team_rating.get(team, INITIAL_RATING)
+    def provisional(reg):
+        n = intl_series_count[reg]
+        frac = max(0.0, 1.0 - n / PROVISIONAL_SERIES)
+        return 1.0 + (PROVISIONAL_BOOST - 1.0) * frac
 
     for y in sorted(per_year):
         df = per_year[y]
-        dom = df[~df["league"].isin(INTERNATIONAL)]
 
-        # Each team's region THIS year, from its domestic games (handles teams
-        # that change leagues between years). Most common league wins.
         counts = defaultdict(Counter)
-        for team, lg in zip(dom["teamname"], dom["league"]):
-            counts[team][region_of(lg)] += 1
+        for team, lg in zip(df["teamname"], df["league"]):
+            reg = region_for(lg, y)
+            if reg:
+                counts[team][reg] += 1
         team_region_y = {t: c.most_common(1)[0][0] for t, c in counts.items()}
 
-        # This year's roster per region (only in-scope regions).
         roster = defaultdict(list)
         for team, reg in team_region_y.items():
-            if in_scope(reg):
-                roster[reg].append(team)
+            roster[reg].append(team)
 
-        # --- SEASON RESET: seed each region's teams around its carried rating,
-        #     ordered by last season's final Elo (a stand-in for last year's finish).
+        # --- SEASON RESET ------------------------------------------------------
         for reg, teams in roster.items():
-            ranked = sorted(teams, key=lambda t: (prev_end.get(t, float("-inf")), t), reverse=True)
-            carried = carried_region.get(reg, INITIAL_RATING)
-            for team, r in seed_ratings(carried, ranked).items():
-                team_rating[team] = r
-
-        # --- PLAY the year's games in date order.
-        games = []
-        for gid, rows in df.groupby("gameid"):
-            if len(rows) != 2:
+            carried = carried_region.get(reg)
+            if carried is None:                       # region debut (e.g. LCP 2025):
+                incoming = [prev_end[t] for t in teams if t in prev_end]
+                carried = mean(incoming) if incoming else INITIAL_RATING
+                carried_region[reg] = carried
+            returning = sorted((t for t in teams if t in prev_end),
+                               key=lambda t: prev_end[t], reverse=True)
+            newcomers = [t for t in teams if t not in prev_end]
+            if not returning:
+                for t in teams:
+                    team_rating[t] = carried
                 continue
-            rows = rows.sort_values("side")
-            a, b = rows.iloc[0], rows.iloc[1]
-            games.append((a["date"], a["teamname"], b["teamname"],
-                          a["teamname"] if a["result"] == 1 else b["teamname"], a["league"]))
-        games.sort(key=lambda g: (pd.isna(g[0]), g[0]))
+            fan = seed_fan(len(teams), carried)
+            for t, r in zip(returning, fan):
+                team_rating[t] = r
+            q_idx = round((1.0 - NEW_TEAM_QUANTILE) * (len(teams) - 1))
+            for t in newcomers:
+                team_rating[t] = fan[q_idx]
 
-        for date, ta, tb, winner, league in games:
-            ra_reg = team_region_y.get(ta)
-            rb_reg = team_region_y.get(tb)
-            is_intl = league in INTERNATIONAL
-            cross = is_intl and ra_reg is not None and rb_reg is not None and ra_reg != rb_reg
+        active = set(team_region_y)
+        team_rating = {t: r for t, r in team_rating.items() if t in active}
 
-            # Only rate games between in-scope teams.
-            if is_intl:
-                if not (ra_reg and rb_reg and in_scope(ra_reg) and in_scope(rb_reg)):
+        # --- PLAY the year's SERIES in date order --------------------------------
+        for s in build_series(df):
+            league, ta, tb = s["league"], s["team_a"], s["team_b"]
+            wa, wb = s["wins_a"], s["wins_b"]
+            if region_for(league, y):                                # tier-1 domestic
+                cross = False
+                k = K_REGIONAL
+            elif league in INTERNATIONAL_K:                          # international
+                ra, rb = team_region_y.get(ta), team_region_y.get(tb)
+                if ra is None or rb is None:                         # unmapped guest
                     continue
+                cross = ra != rb
+                k = INTERNATIONAL_K[league]
+                if s["playoffs"]:
+                    k *= PLAYOFF_MULT
+                if cross:
+                    k *= (provisional(ra) + provisional(rb)) / 2.0
+                    intl_series_count[ra] += 1
+                    intl_series_count[rb] += 1
             else:
-                if not in_scope(region_of(league)):
-                    continue
+                continue                                             # everything else
 
-            k = K_INTERNATIONAL if cross else K_REGIONAL
-            before_a, before_b = rating_of(ta), rating_of(tb)
-            score_a = 1.0 if winner == ta else 0.0
-            new_a, new_b = update(before_a, before_b, score_a, k)
-            team_rating[ta], team_rating[tb] = new_a, new_b
-            match_history.append({
-                "year": y, "date": date.date() if not pd.isna(date) else None,
-                "league": league, "cross_region": cross,
-                "team_a": ta, "team_b": tb, "winner": winner,
-                "a_before": round(before_a, 1), "a_after": round(new_a, 1),
-                "b_before": round(before_b, 1), "b_after": round(new_b, 1),
+            if wa == wb:                        # rare data oddity: treat as a draw
+                score_a, mult = 0.5, MARGIN_MIN
+            else:
+                score_a = 1.0 if wa > wb else 0.0
+                mult = margin_mult(max(wa, wb), min(wa, wb))
+
+            k_eff = k * mult
+            before_a, before_b = team_rating[ta], team_rating[tb]
+            delta = k_eff * (score_a - expected(before_a, before_b))
+            team_rating[ta] = before_a + delta
+            team_rating[tb] = before_b - delta
+            series_history.append({
+                "year": y, "date": s["date"].date() if not pd.isna(s["date"]) else None,
+                "league": league, "playoffs": s["playoffs"], "cross_region": cross,
+                "team_a": ta, "team_b": tb, "score": f"{wa}-{wb}",
+                "k_eff": round(k_eff, 2),
+                "a_before": round(before_a, 1), "a_after": round(team_rating[ta], 1),
+                "b_before": round(before_b, 1), "b_after": round(team_rating[tb], 1),
             })
 
-        # --- END OF SEASON: record each region's rating and carry it forward.
+        # --- END OF SEASON ---------------------------------------------------------
         for reg, teams in roster.items():
-            r = mean(rating_of(t) for t in teams)
+            r = mean(team_rating[t] for t in teams)
             carried_region[reg] = r
-            region_history.append({"year": y, "region": reg, "rating": round(r, 1),
-                                    "teams": len(teams)})
+            region_history.append({"year": y, "region": reg,
+                                   "rating": round(r, 1), "teams": len(teams)})
+        yearly_top[y] = sorted(((t, team_rating[t], team_region_y[t]) for t in active),
+                               key=lambda x: x[1], reverse=True)
         prev_end = dict(team_rating)
 
-    _report(region_history, match_history, team_rating, carried_region)
+    _report(region_history, series_history, yearly_top)
 
 
-def _report(region_history, match_history, team_rating, carried_region):
-    last_year = max(r["year"] for r in region_history)
-
-    print(f"\nRegion strength at end of {last_year} (carried into next season):")
-    for reg, rating in sorted(carried_region.items(), key=lambda kv: kv[1], reverse=True)[:15]:
-        print(f"  {reg:<10} {rating:7.1f}")
-
-    print("\nTop 20 teams by current Elo:")
-    for team, r in sorted(team_rating.items(), key=lambda kv: kv[1], reverse=True)[:20]:
-        print(f"  {team:<24} {r:7.1f}")
-
+def _report(region_history, series_history, yearly_top):
     reg_df = pd.DataFrame(region_history)
-    reg_df.to_csv("region_ratings_by_year.csv", index=False)
-    pd.DataFrame(match_history).to_csv("match_history.csv", index=False)
-    print("\nWrote region_ratings_by_year.csv and match_history.csv")
 
-    # Optional chart -- only if matplotlib is installed.
+    for y in sorted(yearly_top):
+        print(f"\n{'='*24}  {y}  {'='*24}")
+        yr = reg_df[reg_df["year"] == y].sort_values("rating", ascending=False)
+        print("Region strength: " + " | ".join(
+            f"{r.region} {r.rating:.0f}" for r in yr.itertuples()))
+        print(f"Top {TOP_N} teams:")
+        for i, (team, rating, reg) in enumerate(yearly_top[y][:TOP_N], 1):
+            print(f"  {i:>2}. {team:<28} {rating:7.1f}  ({reg})")
+
+    reg_df.to_csv("region_ratings_by_year.csv", index=False)
+    pd.DataFrame(series_history).to_csv("series_history.csv", index=False)
+    team_rows = [{"year": y, "rank": i, "team": t, "region": reg, "rating": round(r, 1)}
+                 for y in sorted(yearly_top)
+                 for i, (t, r, reg) in enumerate(yearly_top[y], 1)]
+    pd.DataFrame(team_rows).to_csv("team_ratings_by_year.csv", index=False)
+    print("\nWrote region_ratings_by_year.csv, team_ratings_by_year.csv, series_history.csv")
+
     try:
         import matplotlib.pyplot as plt
-
-        top = (reg_df.groupby("region")["rating"].max()
-               .sort_values(ascending=False).head(8).index)
-        fig, ax = plt.subplots(figsize=(11, 6))
-        for reg in top:
-            sub = reg_df[reg_df["region"] == reg]
-            ax.plot(sub["year"], sub["rating"], marker="o", label=reg)
-        ax.set_title("Region Elo over time")
-        ax.set_xlabel("Year")
-        ax.set_ylabel("Region Elo (mean of teams)")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig("region_ratings.png", dpi=130)
-        print("Wrote region_ratings.png")
     except ImportError:
-        print("(install matplotlib for a region_ratings.png chart)")
+        print("(install matplotlib for the charts)")
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for reg in sorted(reg_df["region"].unique()):
+        sub = reg_df[reg_df["region"] == reg]
+        ax.plot(sub["year"], sub["rating"], marker="o", label=reg)
+    ax.set_title("Region Elo over time (tier-1 only)")
+    ax.set_xlabel("Year"); ax.set_ylabel("Region Elo (mean of teams)")
+    ax.legend(); fig.tight_layout()
+    fig.savefig("region_ratings.png", dpi=130)
+
+    last = max(yearly_top)
+    focus = [t for t, _, _ in yearly_top[last][:TOP_N]]
+    series = {t: {} for t in focus}
+    for y, rows in yearly_top.items():
+        for t, r, _ in rows:
+            if t in series:
+                series[t][y] = r
+    fig, ax = plt.subplots(figsize=(13, 7))
+    cmap = plt.get_cmap("tab20")
+    for i, t in enumerate(focus):
+        yrs = sorted(series[t])
+        ax.plot(yrs, [series[t][y] for y in yrs], marker="o", ms=3,
+                color=cmap(i % 20), label=t)
+    ax.set_title(f"Top {TOP_N} teams of {last}: Elo over the years")
+    ax.set_xlabel("Year"); ax.set_ylabel("End-of-season Elo")
+    ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+    fig.tight_layout()
+    fig.savefig("top_teams.png", dpi=130)
+    print("Wrote region_ratings.png and top_teams.png")
 
 
 if __name__ == "__main__":
