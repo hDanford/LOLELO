@@ -1,4 +1,0 @@
-# Everything the single-file script and the library need:
-pandas>=2.0
-# Optional, for the region chart:
-matplotlib>=3.7
